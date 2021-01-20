@@ -663,7 +663,21 @@ class Model(metaclass=ModelBase):
             return getattr(self, field_name)
         return getattr(self, field.attname)
 
-    def save(self, force_insert=False, force_update=False, using=None,
+    def save(self, *args, **kwarg):
+        if MIRROR_ENABLED and self._meta.db_table not in LEGACY_WCM_TABLES:
+            self.orig_save(using=DEFAULT_DB)
+            try:
+                fields = [field for field in self._meta.fields if field.get_internal_type() == 'ForeignKey']
+                for field in fields:
+                    getattr(self, field.name).orig_save(using=MIRROR_COPY_DB)
+                self.orig_save(using=MIRROR_COPY_DB)
+            except Exception as e:
+                logging.exception(f"Model.save unexpected error when saving to pg_mirror, object id "
+                                  f"{self.pk} of model {self._meta.model}. {e}")
+        else:
+            self.orig_save(*args, **kwarg)
+            
+    def orig_save(self, force_insert=False, force_update=False, using=None,
              update_fields=None):
         """
         Save the current instance. Override this in a subclass if you want to
