@@ -400,6 +400,8 @@ class ModelState:
 import logging
 from django.conf import settings
 from common.db_routers import LEGACY_WCM_TABLES
+from django.db.models.signals import post_save
+from django.db.models.signals import pre_delete
 DEFAULT_DB = 'default'  # main postgres host
 MIRROR_COPY_DB = 'pg_mirror'  # A write only mirror for moving our data from one pg cluster to another
 MIRROR_ENABLED = MIRROR_COPY_DB in settings.DATABASES and settings.DATABASES[MIRROR_COPY_DB].get('ENABLED')
@@ -676,6 +678,11 @@ class Model(metaclass=ModelBase):
     def save(self, *args, **kwarg):
         if MIRROR_ENABLED and self._meta.db_table not in LEGACY_WCM_TABLES:
             self.orig_save(using=DEFAULT_DB)
+            
+            # Disable signals when saving to mirror
+            post_save.receivers = []
+            pre_delete.receivers = []
+            
             try:
                 fields = [field for field in self._meta.fields if field.get_internal_type() == 'ForeignKey']
                 for field in fields:
