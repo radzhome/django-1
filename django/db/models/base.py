@@ -663,6 +663,13 @@ class Model(metaclass=ModelBase):
             return getattr(self, field_name)
         return getattr(self, field.attname)
 
+    # Patch save here, orig_save is original save()
+    import logging
+    from django.conf import settings
+    from common.db_routers import LEGACY_WCM_TABLES
+    DEFAULT_DB = 'default'  # main postgres host
+    MIRROR_COPY_DB = 'pg_mirror'  # A write only mirror for moving our data from one pg cluster to another
+    MIRROR_ENABLED = MIRROR_COPY_DB in settings.DATABASES and settings.DATABASES[MIRROR_COPY_DB].get('ENABLED')
     def save(self, *args, **kwarg):
         if MIRROR_ENABLED and self._meta.db_table not in LEGACY_WCM_TABLES:
             self.orig_save(using=DEFAULT_DB)
@@ -676,7 +683,7 @@ class Model(metaclass=ModelBase):
                                   f"{self.pk} of model {self._meta.model}. {e}")
         else:
             self.orig_save(*args, **kwarg)
-            
+    # patch end -- 
     def orig_save(self, force_insert=False, force_update=False, using=None,
              update_fields=None):
         """
