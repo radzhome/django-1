@@ -404,7 +404,6 @@ from django.db.models.signals import pre_delete
 LEGACY_WCM_TABLES = ['clients', 'configs', 'content', 'videos', 'licenses', 'lists', 'properties']
 DEFAULT_DB = 'default'  # main postgres host
 MIRROR_COPY_DB = 'pg_mirror'  # A write only mirror for moving our data from one pg cluster to another
-MIRROR_ENABLED = MIRROR_COPY_DB in settings.DATABASES and settings.DATABASES[MIRROR_COPY_DB].get('ENABLED')
 # patch end
 
 class Model(metaclass=ModelBase):
@@ -676,6 +675,7 @@ class Model(metaclass=ModelBase):
 
     # Patch save here, orig_save is original save()
     def save(self, *args, **kwarg):
+        MIRROR_ENABLED = MIRROR_COPY_DB in settings.DATABASES and settings.DATABASES[MIRROR_COPY_DB].get('ENABLED')
         if MIRROR_ENABLED and self._meta.db_table not in LEGACY_WCM_TABLES:
             self.orig_save(using=DEFAULT_DB)
             
