@@ -1,6 +1,6 @@
 from django.utils.version import get_version
 
-VERSION = (2, 2, 9999, 'final', 0)
+VERSION = (2, 2, 10000, 'final', 0)
 
 __version__ = '2.2.10000'
 
