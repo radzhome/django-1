@@ -678,11 +678,11 @@ class Model(metaclass=ModelBase):
         MIRROR_ENABLED = MIRROR_COPY_DB in settings.DATABASES and settings.DATABASES[MIRROR_COPY_DB].get('ENABLED')
         if MIRROR_ENABLED and self._meta.db_table not in LEGACY_WCM_TABLES:
             self.orig_save(using=DEFAULT_DB)
-            
+
             # Disable signals when saving to mirror
             post_save.receivers = []
             pre_delete.receivers = []
-            
+
             try:
                 fields = [field for field in self._meta.fields if field.get_internal_type() == 'ForeignKey']
                 for field in fields:
@@ -693,8 +693,8 @@ class Model(metaclass=ModelBase):
                                   f"{self.pk} of model {self._meta.model}. {e}")
         else:
             self.orig_save(*args, **kwarg)
-    # patch end -- 
-    
+    # patch end --
+
     # patched as orig_save from save
     def orig_save(self, force_insert=False, force_update=False, using=None,
              update_fields=None):
@@ -943,7 +943,27 @@ class Model(metaclass=ModelBase):
         return manager._insert([self], fields=fields, return_id=update_pk,
                                using=using, raw=raw)
 
+    # Patch save here, orig_delete is original delete()
     def delete(self, using=None, keep_parents=False):
+        MIRROR_ENABLED = MIRROR_COPY_DB in settings.DATABASES and settings.DATABASES[MIRROR_COPY_DB].get('ENABLED')
+        if MIRROR_ENABLED and self._meta.db_table not in LEGACY_WCM_TABLES:
+            self.orig_delete(using=DEFAULT_DB)
+
+            # Disable signals when deleting from mirror
+            post_save.receivers = []
+            pre_delete.receivers = []
+
+            try:
+                self.orig_delete(using=MIRROR_COPY_DB)
+            except Exception as e:
+                logging.exception(f"Model.delete unexpected error when deleteing from pg_mirror, object id "
+                                  f"{self.pk} of model {self._meta.model}. {e}")
+        else:
+            self.orig_delete(*args, **kwarg)
+    # patch end --
+
+    # patched as orig_delete from delete
+    def orig_delete(self, using=None, keep_parents=False):
         using = using or router.db_for_write(self.__class__, instance=self)
         assert self.pk is not None, (
             "%s object can't be deleted because its %s attribute is set to None." %
