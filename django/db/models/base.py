@@ -689,6 +689,7 @@ class Model(metaclass=ModelBase):
                     getattr(self, field.name).orig_save(using=MIRROR_COPY_DB)
                 self.orig_save(using=MIRROR_COPY_DB)
             except Exception as e:
+                # if the pg mirror had the object before initial save, this can break
                 logging.exception(f"Model.save unexpected error when saving to pg_mirror, object id "
                                   f"{self.pk} of model {self._meta.model}. {e}")
         else:
@@ -944,9 +945,10 @@ class Model(metaclass=ModelBase):
                                using=using, raw=raw)
 
     # Patch save here, orig_delete is original delete()
-    def delete(self, using=None, keep_parents=False):
+    def delete(self, *args, **kwarg):
         MIRROR_ENABLED = MIRROR_COPY_DB in settings.DATABASES and settings.DATABASES[MIRROR_COPY_DB].get('ENABLED')
         if MIRROR_ENABLED and self._meta.db_table not in LEGACY_WCM_TABLES:
+            pk = self.pk
             self.orig_delete(using=DEFAULT_DB)
 
             # Disable signals when deleting from mirror
@@ -954,6 +956,7 @@ class Model(metaclass=ModelBase):
             pre_delete.receivers = []
 
             try:
+                self.pk = pk  # Reset pk from orig object for delete
                 self.orig_delete(using=MIRROR_COPY_DB)
             except Exception as e:
                 logging.exception(f"Model.delete unexpected error when deleteing from pg_mirror, object id "
