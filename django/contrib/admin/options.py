@@ -1095,7 +1095,14 @@ class ModelAdmin(BaseModelAdmin):
 
     def delete_queryset(self, request, queryset):
         """Given a queryset, delete it from the database."""
-        queryset.delete()
+        # queryset.delete()  # orig_delete
+        for obj in queryset:
+            try:
+                obj.delete()
+            except ObjectDoesNotExist:
+                pass
+            except Exception as e:
+                logging.exception(f"delete_queryset unexpected error. {e}")
 
     def save_formset(self, request, form, formset, change):
         """
