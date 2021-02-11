@@ -683,15 +683,33 @@ class Model(metaclass=ModelBase):
             post_save.receivers = []
             pre_delete.receivers = []
 
+            # Save FKs first to mirror
+            fields = [field for field in self._meta.fields if field.get_internal_type() == 'ForeignKey']
+            for field in fields:
+                field_name = field.name
+                # breakpoint()
+                # (Pdb) field.model
+                # <class 'django.contrib.admin.models.LogEntry'>
+                # https://logs.dev.postmedia.digital/goto/43f3050382b77bb5542c629bbcbb7f2f
+                fk_object = getattr(self, field_name)
+                try:
+                    fk_object.orig_save(using=MIRROR_COPY_DB)
+                except Exception:
+                    try:
+                        fk_object.pk = None  # Try saving without retaining pk (new)
+                        fk_object.orig_save(using=MIRROR_COPY_DB)
+                    except Exception as e:
+                        # if the pg mirror had the object before initial save, this can break
+                        logging.exception(f"Model.save unexpected error when saving fk field {field_name} to pg_mirror, "
+                                          f"object id {self.pk} of model {self._meta.model}. {e}")
+
+            # Save the obj to mirror
             try:
-                fields = [field for field in self._meta.fields if field.get_internal_type() == 'ForeignKey']
-                for field in fields:
-                    getattr(self, field.name).orig_save(using=MIRROR_COPY_DB)
                 self.orig_save(using=MIRROR_COPY_DB)
             except Exception as e:
-                # if the pg mirror had the object before initial save, this can break
                 logging.exception(f"Model.save unexpected error when saving to pg_mirror, object id "
                                   f"{self.pk} of model {self._meta.model}. {e}")
+
         else:
             self.orig_save(*args, **kwarg)
     # patch end --
