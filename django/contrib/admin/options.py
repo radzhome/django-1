@@ -2,6 +2,7 @@ import copy
 import json
 import operator
 import re
+from collections import OrderedDict
 from functools import partial, reduce, update_wrapper
 from urllib.parse import quote as urlquote
 
@@ -30,6 +31,7 @@ from django.core.exceptions import (
 from django.core.paginator import Paginator
 from django.db import models, router, transaction
 from django.db.models.constants import LOOKUP_SEP
+from django.db.models.fields import BLANK_CHOICE_DASH
 from django.forms.formsets import DELETION_FIELD_NAME, all_valid
 from django.forms.models import (
     BaseInlineFormSet, inlineformset_factory, modelform_defines_fields,
@@ -43,10 +45,9 @@ from django.urls import reverse
 from django.utils.decorators import method_decorator
 from django.utils.html import format_html
 from django.utils.http import urlencode
+from django.utils.inspect import get_func_args
 from django.utils.safestring import mark_safe
-from django.utils.text import (
-    capfirst, format_lazy, get_text_list, smart_split, unescape_string_literal,
-)
+from django.utils.text import capfirst, format_lazy, get_text_list
 from django.utils.translation import gettext as _, ngettext
 from django.views.decorators.csrf import csrf_protect
 from django.views.generic import RedirectView
@@ -251,25 +252,17 @@ class BaseModelAdmin(metaclass=forms.MediaDefiningClass):
             return None
         db = kwargs.get('using')
 
-        if 'widget' not in kwargs:
-            autocomplete_fields = self.get_autocomplete_fields(request)
-            if db_field.name in autocomplete_fields:
-                kwargs['widget'] = AutocompleteSelectMultiple(
-                    db_field.remote_field,
-                    self.admin_site,
-                    using=db,
-                )
-            elif db_field.name in self.raw_id_fields:
-                kwargs['widget'] = widgets.ManyToManyRawIdWidget(
-                    db_field.remote_field,
-                    self.admin_site,
-                    using=db,
-                )
-            elif db_field.name in [*self.filter_vertical, *self.filter_horizontal]:
-                kwargs['widget'] = widgets.FilteredSelectMultiple(
-                    db_field.verbose_name,
-                    db_field.name in self.filter_vertical
-                )
+        autocomplete_fields = self.get_autocomplete_fields(request)
+        if db_field.name in autocomplete_fields:
+            kwargs['widget'] = AutocompleteSelectMultiple(db_field.remote_field, self.admin_site, using=db)
+        elif db_field.name in self.raw_id_fields:
+            kwargs['widget'] = widgets.ManyToManyRawIdWidget(db_field.remote_field, self.admin_site, using=db)
+        elif db_field.name in [*self.filter_vertical, *self.filter_horizontal]:
+            kwargs['widget'] = widgets.FilteredSelectMultiple(
+                db_field.verbose_name,
+                db_field.name in self.filter_vertical
+            )
+
         if 'queryset' not in kwargs:
             queryset = self.get_field_queryset(db, db_field, request)
             if queryset is not None:
@@ -278,7 +271,7 @@ class BaseModelAdmin(metaclass=forms.MediaDefiningClass):
         form_field = db_field.formfield(**kwargs)
         if (isinstance(form_field.widget, SelectMultiple) and
                 not isinstance(form_field.widget, (CheckboxSelectMultiple, AutocompleteSelectMultiple))):
-            msg = _('Hold down “Control”, or “Command” on a Mac, to select more than one.')
+            msg = _('Hold down "Control", or "Command" on a Mac, to select more than one.')
             help_text = form_field.help_text
             form_field.help_text = format_lazy('{} {}', help_text, msg) if help_text else msg
         return form_field
@@ -296,7 +289,7 @@ class BaseModelAdmin(metaclass=forms.MediaDefiningClass):
 
         if callable(self.view_on_site):
             return self.view_on_site(obj)
-        elif hasattr(obj, 'get_absolute_url'):
+        elif self.view_on_site and hasattr(obj, 'get_absolute_url'):
             # use the ContentType lookup if view_on_site is True
             return reverse('admin:view_on_site', kwargs={
                 'content_type_id': get_content_type_for_model(obj).pk,
@@ -335,10 +328,6 @@ class BaseModelAdmin(metaclass=forms.MediaDefiningClass):
         if self.fieldsets:
             return self.fieldsets
         return [(None, {'fields': self.get_fields(request, obj)})]
-
-    def get_inlines(self, request, obj):
-        """Hook for specifying custom inlines."""
-        return self.inlines
 
     def get_ordering(self, request):
         """
@@ -595,14 +584,15 @@ class ModelAdmin(BaseModelAdmin):
 
     def get_inline_instances(self, request, obj=None):
         inline_instances = []
-        for inline_class in self.get_inlines(request, obj):
+        for inline_class in self.inlines:
             inline = inline_class(self.model, self.admin_site)
             if request:
+                inline_has_add_permission = inline._has_add_permission(request, obj)
                 if not (inline.has_view_or_change_permission(request, obj) or
-                        inline.has_add_permission(request, obj) or
+                        inline_has_add_permission or
                         inline.has_delete_permission(request, obj)):
                     continue
-                if not inline.has_add_permission(request, obj):
+                if not inline_has_add_permission:
                     inline.max_num = 0
             inline_instances.append(inline)
 
@@ -619,7 +609,7 @@ class ModelAdmin(BaseModelAdmin):
 
         info = self.model._meta.app_label, self.model._meta.model_name
 
-        return [
+        urlpatterns = [
             path('', wrap(self.changelist_view), name='%s_%s_changelist' % info),
             path('add/', wrap(self.add_view), name='%s_%s_add' % info),
             path('autocomplete/', wrap(self.autocomplete_view), name='%s_%s_autocomplete' % info),
@@ -631,6 +621,7 @@ class ModelAdmin(BaseModelAdmin):
                 pattern_name='%s:%s_%s_change' % ((self.admin_site.name,) + info)
             ))),
         ]
+        return urlpatterns
 
     @property
     def urls(self):
@@ -644,9 +635,9 @@ class ModelAdmin(BaseModelAdmin):
             'jquery.init.js',
             'core.js',
             'admin/RelatedObjectLookups.js',
-            'actions.js',
+            'actions%s.js' % extra,
             'urlify.js',
-            'prepopulate.js',
+            'prepopulate%s.js' % extra,
             'vendor/xregexp/xregexp%s.js' % extra,
         ]
         return forms.Media(js=['admin/js/%s' % url for url in js])
@@ -693,7 +684,10 @@ class ModelAdmin(BaseModelAdmin):
         exclude = exclude or None
 
         # Remove declared form fields which are in readonly_fields.
-        new_attrs = dict.fromkeys(f for f in readonly_fields if f in self.form.declared_fields)
+        new_attrs = OrderedDict.fromkeys(
+            f for f in readonly_fields
+            if f in self.form.declared_fields
+        )
         form = type(self.form.__name__, (self.form,), new_attrs)
 
         defaults = {
@@ -808,7 +802,7 @@ class ModelAdmin(BaseModelAdmin):
 
         The default implementation creates an admin LogEntry object.
         """
-        from django.contrib.admin.models import ADDITION, LogEntry
+        from django.contrib.admin.models import LogEntry, ADDITION
         return LogEntry.objects.log_action(
             user_id=request.user.pk,
             content_type_id=get_content_type_for_model(object).pk,
@@ -824,7 +818,7 @@ class ModelAdmin(BaseModelAdmin):
 
         The default implementation creates an admin LogEntry object.
         """
-        from django.contrib.admin.models import CHANGE, LogEntry
+        from django.contrib.admin.models import LogEntry, CHANGE
         return LogEntry.objects.log_action(
             user_id=request.user.pk,
             content_type_id=get_content_type_for_model(object).pk,
@@ -841,7 +835,7 @@ class ModelAdmin(BaseModelAdmin):
 
         The default implementation creates an admin LogEntry object.
         """
-        from django.contrib.admin.models import DELETION, LogEntry
+        from django.contrib.admin.models import LogEntry, DELETION
         return LogEntry.objects.log_action(
             user_id=request.user.pk,
             content_type_id=get_content_type_for_model(object).pk,
@@ -857,27 +851,18 @@ class ModelAdmin(BaseModelAdmin):
         return helpers.checkbox.render(helpers.ACTION_CHECKBOX_NAME, str(obj.pk))
     action_checkbox.short_description = mark_safe('<input type="checkbox" id="action-toggle">')
 
-    @staticmethod
-    def _get_action_description(func, name):
-        return getattr(func, 'short_description', capfirst(name.replace('_', ' ')))
-
     def _get_base_actions(self):
         """Return the list of actions, prior to any request-based filtering."""
         actions = []
-        base_actions = (self.get_action(action) for action in self.actions or [])
-        # get_action might have returned None, so filter any of those out.
-        base_actions = [action for action in base_actions if action]
-        base_action_names = {name for _, name, _ in base_actions}
 
         # Gather actions from the admin site first
         for (name, func) in self.admin_site.actions:
-            if name in base_action_names:
-                continue
-            description = self._get_action_description(func, name)
+            description = getattr(func, 'short_description', name.replace('_', ' '))
             actions.append((func, name, description))
         # Add actions from this ModelAdmin.
-        actions.extend(base_actions)
-        return actions
+        actions.extend(self.get_action(action) for action in self.actions or [])
+        # get_action might have returned None, so filter any of those out.
+        return filter(None, actions)
 
     def _filter_actions_by_permissions(self, request, actions):
         """Filter out any actions that the user doesn't have access to."""
@@ -903,11 +888,15 @@ class ModelAdmin(BaseModelAdmin):
         # If self.actions is set to None that means actions are disabled on
         # this page.
         if self.actions is None or IS_POPUP_VAR in request.GET:
-            return {}
+            return OrderedDict()
         actions = self._filter_actions_by_permissions(request, self._get_base_actions())
-        return {name: (func, name, desc) for func, name, desc in actions}
+        # Convert the actions into an OrderedDict keyed by name.
+        return OrderedDict(
+            (name, (func, name, desc))
+            for func, name, desc in actions
+        )
 
-    def get_action_choices(self, request, default_choices=models.BLANK_CHOICE_DASH):
+    def get_action_choices(self, request, default_choices=BLANK_CHOICE_DASH):
         """
         Return a list of choices for use in a form object.  Each choice is a
         tuple (name, description).
@@ -942,7 +931,10 @@ class ModelAdmin(BaseModelAdmin):
             except KeyError:
                 return None
 
-        description = self._get_action_description(func, action)
+        if hasattr(func, 'short_description'):
+            description = func.short_description
+        else:
+            description = capfirst(action.replace('_', ' '))
         return func, action, description
 
     def get_list_display(self, request):
@@ -1025,9 +1017,7 @@ class ModelAdmin(BaseModelAdmin):
         if search_fields and search_term:
             orm_lookups = [construct_search(str(search_field))
                            for search_field in search_fields]
-            for bit in smart_split(search_term):
-                if bit.startswith(('"', "'")):
-                    bit = unescape_string_literal(bit)
+            for bit in search_term.split():
                 or_queries = [models.Q(**{orm_lookup: bit})
                               for orm_lookup in orm_lookups]
                 queryset = queryset.filter(reduce(operator.or_, or_queries))
@@ -1105,7 +1095,14 @@ class ModelAdmin(BaseModelAdmin):
 
     def delete_queryset(self, request, queryset):
         """Given a queryset, delete it from the database."""
-        queryset.delete()
+        # queryset.delete()  # orig_delete
+        for obj in queryset:
+            try:
+                obj.delete()
+            except ObjectDoesNotExist:
+                pass
+            except Exception as e:
+                logging.exception(f"delete_queryset unexpected error. {e}")
 
     def save_formset(self, request, form, formset, change):
         """
@@ -1145,7 +1142,7 @@ class ModelAdmin(BaseModelAdmin):
             'has_delete_permission': self.has_delete_permission(request, obj),
             'has_editable_inline_admin_formsets': has_editable_inline_admin_formsets,
             'has_file_field': context['adminform'].form.is_multipart() or any(
-                admin_formset.formset.is_multipart()
+                admin_formset.formset.form().is_multipart()
                 for admin_formset in context['inline_admin_formsets']
             ),
             'has_absolute_url': view_on_site_url is not None,
@@ -1219,7 +1216,7 @@ class ModelAdmin(BaseModelAdmin):
                 "_saveasnew" in request.POST and self.save_as_continue and
                 self.has_change_permission(request, obj)
         ):
-            msg = _('The {name} “{obj}” was added successfully.')
+            msg = _('The {name} "{obj}" was added successfully.')
             if self.has_change_permission(request, obj):
                 msg += ' ' + _('You may edit it again below.')
             self.message_user(request, format_html(msg, **msg_dict), messages.SUCCESS)
@@ -1233,7 +1230,7 @@ class ModelAdmin(BaseModelAdmin):
 
         elif "_addanother" in request.POST:
             msg = format_html(
-                _('The {name} “{obj}” was added successfully. You may add another {name} below.'),
+                _('The {name} "{obj}" was added successfully. You may add another {name} below.'),
                 **msg_dict
             )
             self.message_user(request, msg, messages.SUCCESS)
@@ -1243,7 +1240,7 @@ class ModelAdmin(BaseModelAdmin):
 
         else:
             msg = format_html(
-                _('The {name} “{obj}” was added successfully.'),
+                _('The {name} "{obj}" was added successfully.'),
                 **msg_dict
             )
             self.message_user(request, msg, messages.SUCCESS)
@@ -1283,7 +1280,7 @@ class ModelAdmin(BaseModelAdmin):
         }
         if "_continue" in request.POST:
             msg = format_html(
-                _('The {name} “{obj}” was changed successfully. You may edit it again below.'),
+                _('The {name} "{obj}" was changed successfully. You may edit it again below.'),
                 **msg_dict
             )
             self.message_user(request, msg, messages.SUCCESS)
@@ -1293,7 +1290,7 @@ class ModelAdmin(BaseModelAdmin):
 
         elif "_saveasnew" in request.POST:
             msg = format_html(
-                _('The {name} “{obj}” was added successfully. You may edit it again below.'),
+                _('The {name} "{obj}" was added successfully. You may edit it again below.'),
                 **msg_dict
             )
             self.message_user(request, msg, messages.SUCCESS)
@@ -1306,7 +1303,7 @@ class ModelAdmin(BaseModelAdmin):
 
         elif "_addanother" in request.POST:
             msg = format_html(
-                _('The {name} “{obj}” was changed successfully. You may add another {name} below.'),
+                _('The {name} "{obj}" was changed successfully. You may add another {name} below.'),
                 **msg_dict
             )
             self.message_user(request, msg, messages.SUCCESS)
@@ -1318,7 +1315,7 @@ class ModelAdmin(BaseModelAdmin):
 
         else:
             msg = format_html(
-                _('The {name} “{obj}” was changed successfully.'),
+                _('The {name} "{obj}" was changed successfully.'),
                 **msg_dict
             )
             self.message_user(request, msg, messages.SUCCESS)
@@ -1439,7 +1436,7 @@ class ModelAdmin(BaseModelAdmin):
 
         self.message_user(
             request,
-            _('The %(name)s “%(obj)s” was deleted successfully.') % {
+            _('The %(name)s "%(obj)s" was deleted successfully.') % {
                 'name': opts.verbose_name,
                 'obj': obj_display,
             },
@@ -1488,7 +1485,7 @@ class ModelAdmin(BaseModelAdmin):
             fieldsets = list(inline.get_fieldsets(request, obj))
             readonly = list(inline.get_readonly_fields(request, obj))
             if can_edit_parent:
-                has_add_permission = inline.has_add_permission(request, obj)
+                has_add_permission = inline._has_add_permission(request, obj)
                 has_change_permission = inline.has_change_permission(request, obj)
                 has_delete_permission = inline.has_delete_permission(request, obj)
             else:
@@ -1525,7 +1522,7 @@ class ModelAdmin(BaseModelAdmin):
         Create a message informing the user that the object doesn't exist
         and return a redirect to the admin index page.
         """
-        msg = _('%(name)s with ID “%(key)s” doesn’t exist. Perhaps it was deleted?') % {
+        msg = _("""%(name)s with ID "%(key)s" doesn't exist. Perhaps it was deleted?""") % {
             'name': opts.verbose_name,
             'key': unquote(object_id),
         }
@@ -1569,10 +1566,7 @@ class ModelAdmin(BaseModelAdmin):
             if obj is None:
                 return self._get_obj_does_not_exist_redirect(request, opts, object_id)
 
-        fieldsets = self.get_fieldsets(request, obj)
-        ModelForm = self.get_form(
-            request, obj, change=not add, fields=flatten_fieldsets(fieldsets)
-        )
+        ModelForm = self.get_form(request, obj, change=not add)
         if request.method == 'POST':
             form = ModelForm(request.POST, request.FILES, instance=obj)
             form_validated = form.is_valid()
@@ -1603,12 +1597,12 @@ class ModelAdmin(BaseModelAdmin):
                 formsets, inline_instances = self._create_formsets(request, obj, change=True)
 
         if not add and not self.has_change_permission(request, obj):
-            readonly_fields = flatten_fieldsets(fieldsets)
+            readonly_fields = flatten_fieldsets(self.get_fieldsets(request, obj))
         else:
             readonly_fields = self.get_readonly_fields(request, obj)
         adminForm = helpers.AdminForm(
             form,
-            list(fieldsets),
+            list(self.get_fieldsets(request, obj)),
             # Clear prepopulated fields on a view-only form to avoid a crash.
             self.get_prepopulated_fields(request, obj) if add or self.has_change_permission(request, obj) else {},
             readonly_fields,
@@ -1628,7 +1622,6 @@ class ModelAdmin(BaseModelAdmin):
         context = {
             **self.admin_site.each_context(request),
             'title': title % opts.verbose_name,
-            'subtitle': str(obj) if obj else None,
             'adminform': adminForm,
             'object_id': object_id,
             'original': obj,
@@ -1817,7 +1810,6 @@ class ModelAdmin(BaseModelAdmin):
             'selection_note': _('0 of %(cnt)s selected') % {'cnt': len(cl.result_list)},
             'selection_note_all': selection_note_all % {'total_count': cl.result_count},
             'title': cl.title,
-            'subtitle': None,
             'is_popup': cl.is_popup,
             'to_field': cl.to_field,
             'cl': cl,
@@ -1913,7 +1905,6 @@ class ModelAdmin(BaseModelAdmin):
     def history_view(self, request, object_id, extra_context=None):
         "The 'history' admin view for this model."
         from django.contrib.admin.models import LogEntry
-
         # First check if the user can see this history.
         model = self.model
         obj = self.get_object(request, unquote(object_id))
@@ -2032,12 +2023,18 @@ class InlineModelAdmin(BaseModelAdmin):
     @property
     def media(self):
         extra = '' if settings.DEBUG else '.min'
-        js = ['vendor/jquery/jquery%s.js' % extra, 'jquery.init.js', 'inlines.js']
+        js = ['vendor/jquery/jquery%s.js' % extra, 'jquery.init.js',
+              'inlines%s.js' % extra]
         if self.filter_vertical or self.filter_horizontal:
             js.extend(['SelectBox.js', 'SelectFilter2.js'])
         if self.classes and 'collapse' in self.classes:
-            js.append('collapse.js')
+            js.append('collapse%s.js' % extra)
         return forms.Media(js=['admin/js/%s' % url for url in js])
+
+    def _has_add_permission(self, request, obj):
+        # RemovedInDjango30Warning: obj will be a required argument.
+        args = get_func_args(self.has_add_permission)
+        return self.has_add_permission(request, obj) if 'obj' in args else self.has_add_permission(request)
 
     def get_extra(self, request, obj=None, **kwargs):
         """Hook for customizing the number of extra inline forms."""
@@ -2084,7 +2081,7 @@ class InlineModelAdmin(BaseModelAdmin):
 
         base_model_form = defaults['form']
         can_change = self.has_change_permission(request, obj) if request else True
-        can_add = self.has_add_permission(request, obj) if request else True
+        can_add = self._has_add_permission(request, obj) if request else True
 
         class DeleteProtectedModelForm(base_model_form):
 
@@ -2167,7 +2164,8 @@ class InlineModelAdmin(BaseModelAdmin):
             for perm in perms
         )
 
-    def has_add_permission(self, request, obj):
+    def has_add_permission(self, request, obj=None):
+        # RemovedInDjango30Warning: obj becomes a mandatory argument.
         if self.opts.auto_created:
             # Auto-created intermediate models don't have their own
             # permissions. The user needs to have the change permission for the
