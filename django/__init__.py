@@ -1,8 +1,8 @@
 from django.utils.version import get_version
 
-VERSION = (2, 2, 10002, 'final', 0)
+VERSION = (2, 2, 10003, 'final', 0)
 
-__version__ = '2.2.10002'
+__version__ = '2.2.10003'
 
 
 def setup(set_prefix=True):
