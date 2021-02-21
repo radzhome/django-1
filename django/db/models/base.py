@@ -401,7 +401,12 @@ import logging
 from django.conf import settings
 from django.db.models.signals import post_save
 from django.db.models.signals import pre_delete
+# Below copied from db_routers.py
 LEGACY_WCM_TABLES = ['clients', 'configs', 'content', 'videos', 'licenses', 'lists', 'properties']
+# NO_MIRROR_TABLES = ['auth_group', 'auth_group_permissions', 'auth_permission', 'auth_user', 'auth_user_groups',
+#                     'auth_user_user_permissions', 'django_admin_log']
+NO_MIRROR_TABLES = ['django_admin_log', ]  # Table may have conflicting fks, will do best effort to copy
+EXEMPT_TABLES = LEGACY_WCM_TABLES + NO_MIRROR_TABLES
 DEFAULT_DB = 'default'  # main postgres host
 MIRROR_COPY_DB = 'pg_mirror'  # A write only mirror for moving our data from one pg cluster to another
 # patch end
@@ -676,9 +681,10 @@ class Model(metaclass=ModelBase):
     # Patch save here, orig_save is original save()
     def save(self, *args, **kwarg):
         MIRROR_ENABLED = MIRROR_COPY_DB in settings.DATABASES and settings.DATABASES[MIRROR_COPY_DB].get('ENABLED')
-        if MIRROR_ENABLED and self._meta.db_table not in LEGACY_WCM_TABLES:
-            self.orig_save(using=DEFAULT_DB)
-
+        if MIRROR_ENABLED and self._meta.db_table not in EXEMPT_TABLES:
+            kwarg['using'] = DEFAULT_DB  # Change saving to default db first
+            self.orig_save(*args, **kwarg)
+            kwarg['using'] = MIRROR_COPY_DB #  Change saving to mirror
             # Disable signals when saving to mirror
             post_save.receivers = []
             pre_delete.receivers = []
@@ -687,28 +693,55 @@ class Model(metaclass=ModelBase):
             fields = [field for field in self._meta.fields if field.get_internal_type() == 'ForeignKey']
             for field in fields:
                 field_name = field.name
-                # breakpoint()
-                # (Pdb) field.model
-                # <class 'django.contrib.admin.models.LogEntry'>
-                # https://logs.dev.postmedia.digital/goto/43f3050382b77bb5542c629bbcbb7f2f
                 fk_object = getattr(self, field_name)
                 try:
-                    fk_object.orig_save(using=MIRROR_COPY_DB)
+                    fk_object.orig_save(*args, **kwarg)
                 except Exception:
+                    if field._meta.db_table in EXEMPT_TABLES:
+                        continue
+                    cur_model = fk_object._meta.model
+                    # TODO: need to handle
+                    unique_fields = fk_object._meta.unique_together
+                    if unique_fields:
+                        unique_fields = unique_fields[0]
+
                     try:
-                        fk_object.pk = None  # Try saving without retaining pk (new)
-                        fk_object.orig_save(using=MIRROR_COPY_DB)
+                        # Based on unique fields, delete the conflicting obj in mirror db
+                        if unique_fields:
+                            orm_query = {}
+                            for field in unique_fields:
+                                orm_query[field] = getattr(fk_object, field, None)
+                            # Delete conflicting obj
+                            cur_model.objects.using(MIRROR_COPY_DB).get(**orm_query).orig_delete(using=MIRROR_COPY_DB)
+
+                        try:
+                            # Try force insert, then force update
+                            kwarg['force_insert'] = True
+                            kwarg['force_update'] = False
+                            fk_object.orig_save(*args, **kwarg)
+                        except Exception:
+                            raise
+                            kwarg['force_insert'] = False
+                            kwarg['force_update'] = True
+                            fk_object.orig_save(*args, **kwarg)
                     except Exception as e:
                         # if the pg mirror had the object before initial save, this can break
-                        logging.exception(f"Model.save unexpected error when saving fk field {field_name} to pg_mirror, "
+                        logging.exception(f"Model.save unexpected error when cleaning up & saving fk "
+                                          f"field {field_name} to pg_mirror, "
                                           f"object id {self.pk} of model {self._meta.model}. {e}")
 
             # Save the obj to mirror
             try:
-                self.orig_save(using=MIRROR_COPY_DB)
+                kwarg['force_update'] = False
+                kwarg['force_insert'] = False
+                self.orig_save(*args, **kwarg)
             except Exception as e:
-                logging.exception(f"Model.save unexpected error when saving to pg_mirror, object id "
-                                  f"{self.pk} of model {self._meta.model}. {e}")
+                try:
+                    kwarg['force_update'] = True
+                    self.orig_save(*args, **kwarg)
+                except Exception as e:
+                    logging.exception(f"Model.save unexpected error when saving to pg_mirror, object id "
+                                      f"{self.pk} of model {self._meta.model}. {e}")
 
         else:
             self.orig_save(*args, **kwarg)
@@ -967,13 +1000,15 @@ class Model(metaclass=ModelBase):
         MIRROR_ENABLED = MIRROR_COPY_DB in settings.DATABASES and settings.DATABASES[MIRROR_COPY_DB].get('ENABLED')
         if MIRROR_ENABLED and self._meta.db_table not in LEGACY_WCM_TABLES:
             pk = self.pk
-            self.orig_delete(using=DEFAULT_DB)
+            kwarg['using'] = DEFAULT_DB # Delete from default db
+            self.orig_delete(*args, **kwarg)
 
             # Disable signals when deleting from mirror
             post_save.receivers = []
             pre_delete.receivers = []
 
             try:
+                kwarg['using'] = MIRROR_COPY_DB  # Delete from mirror db
                 self.pk = pk  # Reset pk from orig object for delete
                 self.orig_delete(using=MIRROR_COPY_DB)
             except Exception as e:
