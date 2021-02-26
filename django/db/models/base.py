@@ -1,4 +1,4 @@
-# Patch Modded!
+# Patch mod applied
 import copy
 import inspect
 import warnings
@@ -402,12 +402,17 @@ import logging
 from django.conf import settings
 from django.db.models.signals import post_save
 from django.db.models.signals import pre_delete
-# Below copied from db_routers.py
+# Below tables not for sync, or best effort (NO_MIRROR_TABLES)
+WP_SYNC_TABLES = ['websites_category', 'websites_categorysponsor', 'websites_menu_item', 'websites_redirect_rule',
+                  'websites_sidebar', 'websites_tag', 'websites_wiodget']
 LEGACY_WCM_TABLES = ['clients', 'configs', 'content', 'videos', 'licenses', 'lists', 'properties']
+NO_SYNC_TABLES = WP_SYNC_TABLES + LEGACY_WCM_TABLES
+
 DRIVING_TABLE_PREFIX = 'driving'  # Excluding all driving tabbles
-# NO_MIRROR_TABLES = ['auth_group', 'auth_group_permissions', 'auth_permission', 'auth_user', 'auth_user_groups',
+# BEST_EFFORT_TABLES = ['auth_group', 'auth_group_permissions', 'auth_permission', 'auth_user', 'auth_user_groups',
 #                     'auth_user_user_perfmissions', 'django_admin_log']  # Will do best to sync these
-NO_MIRROR_TABLES = ['django_admin_log', ]  # Table may have conflicting fks, will do best effort to mirror
+BEST_EFFORT_TABLES = ['django_admin_log', ]  # Table may have conflicting fks, will do best effort to mirror
+BEST_EFFORT_TABLES += NO_SYNC_TABLES
 
 DEFAULT_DB = 'default'  # main postgres host
 MIRROR_COPY_DB = 'pg_mirror'  # A write only mirror for moving our data from one pg cluster to another
@@ -702,7 +707,7 @@ class Model(metaclass=ModelBase):
     def save(self, *args, **kwarg):
         MIRROR_ENABLED = MIRROR_COPY_DB in settings.DATABASES and settings.DATABASES[MIRROR_COPY_DB].get('ENABLED')
         cur_table = self._meta.db_table
-        if self and MIRROR_ENABLED and cur_table not in LEGACY_WCM_TABLES and not cur_table.startswith(DRIVING_TABLE_PREFIX):
+        if self and MIRROR_ENABLED and cur_table not in NO_SYNC_TABLES and not cur_table.startswith(DRIVING_TABLE_PREFIX):
             kwarg['using'] = DEFAULT_DB  # Change saving to default db first
             self.orig_save(*args, **kwarg)
             kwarg['using'] = MIRROR_COPY_DB #  Change saving to mirror
@@ -722,7 +727,7 @@ class Model(metaclass=ModelBase):
                 except Exception:
                     # Doing our best here to save the record
                     try:
-                        if fk_object._meta.db_table in NO_MIRROR_TABLES:
+                        if fk_object._meta.db_table in BEST_EFFORT_TABLES:
                             continue
                     except:
                         continue
@@ -774,7 +779,7 @@ class Model(metaclass=ModelBase):
                         kwarg['force_update'] = True
                         self.orig_save(*args, **kwarg)
                 except Exception as e:
-                    if self._meta.db_table not in NO_MIRROR_TABLES:
+                    if self._meta.db_table not in BEST_EFFORT_TABLES:
                         logging.exception(f"Model.save unexpected error when saving to pg_mirror, object id "
                                           f"{self.pk} of model {self._meta.model}. {e}")
 
@@ -1034,7 +1039,7 @@ class Model(metaclass=ModelBase):
     def delete(self, *args, **kwarg):
         MIRROR_ENABLED = MIRROR_COPY_DB in settings.DATABASES and settings.DATABASES[MIRROR_COPY_DB].get('ENABLED')
         cur_table = self._meta.db_table
-        if MIRROR_ENABLED and cur_table not in LEGACY_WCM_TABLES and not cur_table.startswith(DRIVING_TABLE_PREFIX):
+        if MIRROR_ENABLED and cur_table not in NO_SYNC_TABLES and not cur_table.startswith(DRIVING_TABLE_PREFIX):
             pk = self.pk
             kwarg['using'] = DEFAULT_DB # Delete from default db
             self.orig_delete(*args, **kwarg)
