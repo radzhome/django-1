@@ -1050,8 +1050,8 @@ class Model(metaclass=ModelBase):
             self.orig_delete(*args, **kwarg)
 
             # Disable signals when deleting from mirror
-            pre_delete.receivers = []
             pre_delete_receivers = pre_delete.receivers
+            pre_delete.receivers = []
 
             try:
                 kwarg['using'] = MIRROR_COPY_DB  # Delete from mirror db
